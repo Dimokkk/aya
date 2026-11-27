@@ -1,1 +1,286 @@
-index.html
+"use strict";
+
+/* ---------- настройки (localStorage на устройстве) ---------- */
+let S = { base: "https://api.openai.com/v1", key: "", model: "gpt-4o-mini", tts: true };
+try { Object.assign(S, JSON.parse(localStorage.getItem("aya_settings") || "{}")); } catch {}
+const saveS = () => localStorage.setItem("aya_settings", JSON.stringify(S));
+
+/* ---------- память: IndexedDB ---------- */
+let db;
+const openDB = () => new Promise((res, rej) => {
+  const r = indexedDB.open("aya", 1);
+  r.onupgradeneeded = () => {
+    const d = r.result;
+    for (const s of ["messages", "facts", "memories"])
+      if (!d.objectStoreNames.contains(s)) d.createObjectStore(s, { keyPath: "id", autoIncrement: true });
+    if (!d.objectStoreNames.contains("meta")) d.createObjectStore("meta", { keyPath: "key" });
+  };
+  r.onsuccess = () => res(r.result);
+  r.onerror = () => rej(r.error);
+});
+const req = (r) => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+const store = (n, mode = "readonly") => db.transaction(n, mode).objectStore(n);
+const put = (n, v) => req(store(n, "readwrite").put(v));
+const getAll = (n) => req(store(n).getAll());
+const clearStore = (n) => req(store(n, "readwrite").clear());
+const metaGet = async (k) => (await req(store("meta").get(k)))?.value ?? null;
+const metaSet = (k, value) => put("meta", { key: k, value });
+
+/* ---------- API (любой OpenAI-совместимый сервер) ---------- */
+async function api(path, body) {
+  const r = await fetch(S.base.replace(/\/$/, "") + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer " + S.key },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`API ${r.status}: ${(await r.text()).slice(0, 200)}`);
+  return r.json();
+}
+const chat = (messages, o = {}) =>
+  api("/chat/completions", { model: S.model, messages, temperature: 0.7, max_tokens: 600, ...o })
+    .then(d => (d.choices?.[0]?.message?.content || "").trim());
+const embed = async (texts) =>
+  (await api("/embeddings", { model: "text-embedding-3-small", input: texts })).data.map(d => d.embedding);
+
+/* ---------- векторный поиск по прошлым разговорам ---------- */
+const norm = (v) => { const n = Math.hypot(...v) || 1; return v.map(x => x / n); };
+const cos = (a, b) => { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; };
+
+async function recall(query, k = 6, minSim = 0.3) {
+  const mems = await getAll("memories");
+  if (!mems.length) return [];
+  const [q] = (await embed([query])).map(norm);
+  return mems.map(m => ({ ts: m.ts, text: m.text, s: cos(q, m.vec) }))
+             .filter(m => m.s >= minSim)
+             .sort((a, b) => b.s - a.s)
+             .slice(0, k);
+}
+
+/* ---------- факты о пользователе ---------- */
+async function allFacts() { return (await getAll("facts")).sort((a, b) => a.id - b.id).map(f => f.text); }
+
+async function addFacts(list) {
+  const have = new Set((await getAll("facts")).map(f => f.text.toLowerCase()));
+  for (let t of list) {
+    t = String(t).trim();
+    if (t && !have.has(t.toLowerCase())) { have.add(t.toLowerCase()); await put("facts", { ts: Date.now(), text: t }); }
+  }
+  const all = (await getAll("facts")).sort((a, b) => a.id - b.id);
+  for (const f of all.slice(0, all.length - 80)) await req(store("facts", "readwrite").delete(f.id));
+}
+
+const parseArr = (t) => {
+  t = t.replace(/```(json)?|```/g, "").trim();
+  const a = t.indexOf("["), b = t.lastIndexOf("]");
+  if (a < 0 || b < 0) return [];
+  try { return JSON.parse(t.slice(a, b + 1)); } catch { return []; }
+};
+async function extractFacts(userText, reply) {
+  const raw = await chat([{
+    role: "user",
+    content: "Выдели из реплики пользователя устойчивые факты о нём (имя, работа, проекты, предпочтения, " +
+      "важные события, планы, близкие люди). Только то, что стоит помнить долго.\n" +
+      `Реплика пользователя: «${userText.slice(0, 800)}»\nОтвет ассистента: «${reply.slice(0, 400)}»\n` +
+      "Верни ТОЛЬКО JSON-массив коротких строк на русском. Если фактов нет — []."
+  }], { temperature: 0, max_tokens: 300 });
+  return parseArr(raw).map(x => String(x).trim()).filter(Boolean).slice(0, 6);
+}
+
+/* ---------- сводка давних разговоров ---------- */
+const addMessage = (role, text) => put("messages", { ts: Date.now(), role, text });
+
+async function maybeSummarize() {
+  const all = (await getAll("messages")).sort((a, b) => a.id - b.id);
+  if (all.length < 26) return;
+  const lastId = all[all.length - 1].id;
+  const until = (await metaGet("summarizedUntil")) || 0;
+  const cutoff = lastId - 12;
+  if (cutoff - until < 8) return;
+  const dropped = all.filter(m => m.id > until && m.id <= cutoff);
+  const old = (await metaGet("summary")) || "(пока пусто)";
+  const convo = dropped.map(m => (m.role === "user" ? "Пользователь: " : "Ассистент: ") + m.text.slice(0, 400)).join("\n");
+  const s = await chat([{
+    role: "user",
+    content: "Ты ведёшь сводку давних разговоров с пользователем.\n\n" +
+      `Текущая сводка:\n${old}\n\nНовые сообщения:\n${convo}\n\n` +
+      "Обнови сводку: сохрани всё важное (имена, факты, договорённости, темы), убери мелочи. До 200 слов, только текст."
+  }], { temperature: 0.2, max_tokens: 400 });
+  await metaSet("summary", s);
+  await metaSet("summarizedUntil", cutoff);
+}
+
+/* ---------- системный промпт ---------- */
+const fmt = (ts) => new Date(ts).toLocaleString("ru-RU",
+  { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" });
+
+function buildSystem(facts, summary, memories) {
+  const p = [
+    "Ты — Ая, личный голосовой ассистент пользователя. Вы ведёте давний диалог, и ты постоянно его помнишь.",
+    "Отвечай по-русски, тепло и по делу, 1–4 коротких предложения: текст произносится вслух. Без markdown, списков и эмодзи.",
+    `Сейчас ${fmt(Date.now())}.`,
+  ];
+  if (facts.length) p.push("Достоверно известные факты о пользователе:\n- " + facts.join("\n- "));
+  else p.push("Ты пока ничего не знаешь о пользователе: при первой возможности узнай, как его зовут.");
+  if (summary) p.push("Сводка давних разговоров:\n" + summary);
+  if (memories.length) p.push("Релевантные фрагменты прошлых разговоров:\n" +
+    memories.map(m => `(${fmt(m.ts)}) ${m.text}`).join("\n---\n"));
+  p.push("Используй память естественно, не выдумывай того, чего в ней нет.");
+  return p.join("\n\n");
+}
+
+/* ---------- UI ---------- */
+const $ = (id) => document.getElementById(id);
+const chatEl = $("chat"), micBtn = $("micBtn"), txt = $("txt");
+const setDlg = $("setDlg"), memDlg = $("memDlg");
+
+function bubble(cls, text) {
+  const d = document.createElement("div");
+  d.className = "msg " + cls;
+  d.textContent = text;
+  chatEl.appendChild(d);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  return d;
+}
+const addUserBubble = (t) => bubble("user", t);
+const addBotBubble = (t) => bubble("bot", t);
+const addSysBubble = (t) => bubble("sys", t);
+const showTyping = () => bubble("bot typing", "…");
+
+/* ---------- главный цикл ---------- */
+let busy = false;
+async function handleUserText(text) {
+  if (busy || !text.trim()) return;
+  busy = true;
+  addUserBubble(text);
+  const t = showTyping();
+  try {
+    if (!S.key) throw new Error("Нет API-ключа — открой ⚙️ Настройки и вставь ключ.");
+    const [facts, summary, memories] = await Promise.all([allFacts(), metaGet("summary"), recall(text)]);
+    const recent = (await getAll("messages")).slice(-12).map(m => ({ role: m.role, content: m.text }));
+    const reply = await chat([
+      { role: "system", content: buildSystem(facts, summary, memories) },
+      ...recent,
+      { role: "user", content: text },
+    ]);
+    t.remove();
+    addBotBubble(reply);
+    speak(reply);
+    // память: полный архив + векторный эпизод
+    await addMessage("user", text);
+    await addMessage("assistant", reply);
+    const doc = `Пользователь: ${text.slice(0, 600)}\nАссистент: ${reply.slice(0, 600)}`;
+    const [vec] = (await embed([doc])).map(norm);
+    await put("memories", { ts: Date.now(), text: doc, vec });
+    extractFacts(text, reply).then(addFacts).catch(() => {});   // фон
+    maybeSummarize().catch(() => {});                            // фон
+  } catch (e) {
+    t.remove();
+    addSysBubble("⚠️ " + e.message);
+  } finally { busy = false; }
+}
+
+/* ---------- голосовой ввод (webkitSpeechRecognition) ---------- */
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let rec = null, listening = false, finalBuf = "", interimEl = null;
+
+function toggleMic() {
+  if (listening) { rec.stop(); return; }
+  if (!SR) { addSysBubble("⚠️ Голосовой ввод не поддерживается этим браузером — печатай текстом."); return; }
+  finalBuf = "";
+  rec = new SR();
+  rec.lang = "ru-RU";
+  rec.interimResults = true;
+  rec.continuous = false;
+  rec.onresult = (e) => {
+    let interim = "";
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const r = e.results[i];
+      if (r.isFinal) finalBuf += r[0].transcript + " ";
+      else interim += r[0].transcript;
+    }
+    if (interimEl) interimEl.remove();
+    interimEl = addSysBubble("🎙 " + (finalBuf + interim).trim());
+  };
+  rec.onerror = (e) => { if (e.error !== "aborted") addSysBubble("🎙 Ошибка микрофона: " + e.error); };
+  rec.onend = () => {
+    listening = false; micBtn.classList.remove("on");
+    if (interimEl) { interimEl.remove(); interimEl = null; }
+    const t = finalBuf.trim();
+    if (t) handleUserText(t);
+  };
+  try { rec.start(); listening = true; micBtn.classList.add("on"); } catch {}
+}
+
+/* ---------- озвучка ---------- */
+function ensureVoices() { if ("speechSynthesis" in window) speechSynthesis.getVoices(); }
+function speak(text) {
+  if (!S.tts || !("speechSynthesis" in window)) return;
+  const clean = text.replace(/[#*`_\[\]()>~]/g, "").replace(/\s+/g, " ").trim();
+  if (!clean) return;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(clean);
+  u.lang = "ru-RU";
+  const v = speechSynthesis.getVoices().find(v => /^ru/i.test(v.lang));
+  if (v) u.voice = v;
+  u.rate = 1.05;
+  speechSynthesis.speak(u);
+}
+
+/* ---------- память: просмотр, экспорт, сброс ---------- */
+async function showMemory() {
+  const [facts, msgs, mems, summary] = await Promise.all([allFacts(), getAll("messages"), getAll("memories"), metaGet("summary")]);
+  let out = `сообщений: ${msgs.length}, фактов: ${facts.length}, эпизодов: ${mems.length}\n`;
+  if (facts.length) out += "\n[факты о тебе]\n" + facts.map(f => "• " + f).join("\n");
+  if (summary) out += "\n\n[сводка давних разговоров]\n" + summary;
+  $("memOut").textContent = out.trim() || "Пока пусто — пообщайся со мной!";
+  memDlg.showModal();
+}
+async function exportMemory() {
+  const dump = { exported: new Date().toISOString(), messages: await getAll("messages"),
+                 facts: await getAll("facts"), memories: await getAll("memories"), summary: await metaGet("summary") };
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(dump, null, 2)], { type: "application/json" }));
+  a.download = "aya-memory.json";
+  a.click();
+}
+async function wipe() {
+  if (!confirm("Удалить ВСЮ память безвозвратно?")) return;
+  for (const s of ["messages", "facts", "memories"]) await clearStore(s);
+  await metaSet("summary", ""); await metaSet("summarizedUntil", 0);
+  chatEl.innerHTML = "";
+  addSysBubble("Память очищена.");
+}
+
+/* ---------- настройки ---------- */
+function openSettings() {
+  $("fBase").value = S.base; $("fKey").value = S.key;
+  $("fModel").value = S.model; $("fTts").checked = !!S.tts;
+  setDlg.showModal();
+}
+
+/* ---------- запуск ---------- */
+(async () => {
+  db = await openDB();
+  $("sendBtn").onclick = () => { const t = txt.value.trim(); if (!t) return; txt.value = ""; handleUserText(t); };
+  txt.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("sendBtn").onclick(); } });
+  micBtn.onclick = toggleMic;
+  $("setBtn").onclick = openSettings;
+  $("memBtn").onclick = showMemory;
+  $("expBtn").onclick = exportMemory;
+  $("wipeBtn").onclick = wipe;
+  $("closeSet").onclick = () => setDlg.close();
+  $("closeMem").onclick = () => memDlg.close();
+  $("saveSet").onclick = () => {
+    S.base = $("fBase").value.trim() || "https://api.openai.com/v1";
+    S.key = $("fKey").value.trim();
+    S.model = $("fModel").value.trim() || "gpt-4o-mini";
+    S.tts = $("fTts").checked;
+    saveS();
+    setDlg.close();
+    addSysBubble("Настройки сохранены ✅");
+  };
+  ensureVoices();
+  addSysBubble("Ая на связи. Нажми 🎤 и говори — я всё помню.");
+  if (!S.key) openSettings();
+  if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+})();
